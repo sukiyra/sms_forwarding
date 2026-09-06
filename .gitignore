@@ -3,6 +3,7 @@ code/wifi_config.h
 
 # Local Arduino build output
 build/
+.build/
 
 # Local factory builds and per-device production records
 factory/.build/

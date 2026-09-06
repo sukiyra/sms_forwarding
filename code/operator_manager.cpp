@@ -23,6 +23,11 @@ enum WireStage {
   STAGE_PRIMARY,
   STAGE_REG_WAIT,
   STAGE_CEREG,
+  STAGE_AUTO_RECOVERY,
+  STAGE_AUTO_RECOVERY_WAIT,
+  STAGE_AUTO_RECOVERY_CEREG,
+  STAGE_AUTO_RECOVERY_FORMAT,
+  STAGE_AUTO_RECOVERY_QUERY,
   STAGE_FORMAT,
   STAGE_QUERY,
   STAGE_ABORTING,
@@ -61,9 +66,11 @@ struct OperatorJob {
   String targetNumeric;
   int targetAct = -1;
   bool fromEsim = false;
+  bool recoveryRebooted = false;
   unsigned long startedAt = 0;
   unsigned long commandStartedAt = 0;
   unsigned long phaseAt = 0;
+  unsigned long recoveryStartedAt = 0;
 };
 
 OperatorNetwork networks[MAX_NETWORKS];
@@ -359,6 +366,14 @@ void sendWireCommand(const String& command, WireStage stage, const String& phase
   Serial1.println(command);
 }
 
+void beginAutoRecovery(const String& message, const String& error) {
+  recoveryMessage = message;
+  recoveryError = error;
+  job.recoveryStartedAt = millis();
+  sendWireCommand("AT+COPS=0", STAGE_AUTO_RECOVERY, "recovering",
+                  "目标网络不可用，正在恢复自动选网");
+}
+
 void releaseExclusive() {
   modemReleaseExclusive();
 }
@@ -450,6 +465,34 @@ void handleSuccessfulResponse() {
     return;
   }
 
+  if (job.stage == STAGE_AUTO_RECOVERY) {
+    job.stage = STAGE_AUTO_RECOVERY_WAIT;
+    job.phase = "recovering";
+    job.message = "自动选网命令已接受，等待网络恢复";
+    job.phaseAt = millis();
+    return;
+  }
+
+  if (job.stage == STAGE_AUTO_RECOVERY_FORMAT) {
+    sendWireCommand("AT+COPS?", STAGE_AUTO_RECOVERY_QUERY, "recovering",
+                    "网络已恢复，正在确认当前运营商");
+    return;
+  }
+
+  if (job.stage == STAGE_AUTO_RECOVERY_QUERY) {
+    bool parsed = parseCurrentResponse(responseBuffer);
+    String detail = recoveryError;
+    if (parsed && currentOperator.known) {
+      String actual = operatorCurrentLabel();
+      if (actual.length()) detail += "；已自动恢复到 " + actual;
+    } else {
+      currentOperator.mode = 0;
+      detail += "；已恢复自动选网，运营商信息稍后刷新";
+    }
+    finishJob(false, recoveryMessage, detail);
+    return;
+  }
+
   if (job.stage == STAGE_FORMAT) {
     sendWireCommand("AT+COPS?", STAGE_QUERY, "querying", "正在读取当前运营商");
     return;
@@ -461,11 +504,15 @@ void handleSuccessfulResponse() {
       finishJob(parsed, parsed ? "当前运营商已更新" : "当前运营商暂不可读",
                 parsed ? "" : "AT+COPS? 未返回有效状态", !parsed);
     } else if (!parsed || !currentOperator.known) {
-      finishJob(false, "无法确认当前驻留网络", "AT+COPS? 未返回有效状态");
+      if (job.type == TASK_SELECT) {
+        beginAutoRecovery("目标网络未能完成注册", "模组没有返回目标运营商");
+      } else {
+        finishJob(false, "无法确认当前驻留网络", "AT+COPS? 未返回有效状态");
+      }
     } else if (job.type == TASK_SELECT && currentOperator.numeric != job.targetNumeric) {
       String actual = operatorCurrentLabel();
-      finishJob(false, "目标网络未生效，模组已自动回退",
-                actual.length() ? "当前仍驻留在 " + actual : "当前驻留网络与目标 PLMN 不一致");
+      beginAutoRecovery("目标网络未生效",
+                        actual.length() ? "当前仍驻留在 " + actual : "当前驻留网络与目标 PLMN 不一致");
     } else if (job.type == TASK_AUTO && currentOperator.mode != 0) {
       finishJob(false, "自动选网模式未生效", "AT+COPS? 返回的模式不是自动选网");
     } else {
@@ -483,12 +530,28 @@ void handleSuccessfulResponse() {
     }
     modemReady = false;
     if (registration == 3) {
-      finishJob(false, "目标网络拒绝注册", "当前 Profile 没有该运营商的注册权限");
+      beginAutoRecovery("目标网络拒绝注册", "当前 SIM 或 Profile 没有该运营商的注册权限");
       return;
     }
     job.stage = STAGE_REG_WAIT;
     job.phase = "registering";
     job.message = registration == 2 ? "正在搜索目标网络" : "等待蜂窝网络完成注册";
+    job.phaseAt = millis();
+    return;
+  }
+
+  if (job.stage == STAGE_AUTO_RECOVERY_CEREG) {
+    int registration = parseCeregStatus(responseBuffer);
+    if (registration == 1 || registration == 5) {
+      modemReady = true;
+      sendWireCommand("AT+COPS=3,2", STAGE_AUTO_RECOVERY_FORMAT, "recovering",
+                      "网络已恢复，正在核对运营商");
+      return;
+    }
+    modemReady = false;
+    job.stage = STAGE_AUTO_RECOVERY_WAIT;
+    job.phase = "recovering";
+    job.message = registration == 2 ? "自动选网正在搜索可用网络" : "等待自动选网恢复注册";
     job.phaseAt = millis();
     return;
   }
@@ -506,6 +569,9 @@ int jobProgress() {
   unsigned long elapsed = millis() - job.startedAt;
   if (job.type == TASK_SCAN) return 5 + min(85UL, elapsed * 85UL / 120000UL);
   if (job.stage == STAGE_REG_WAIT || job.stage == STAGE_CEREG) return 72;
+  if (job.stage == STAGE_AUTO_RECOVERY || job.stage == STAGE_AUTO_RECOVERY_WAIT ||
+      job.stage == STAGE_AUTO_RECOVERY_CEREG || job.stage == STAGE_AUTO_RECOVERY_FORMAT ||
+      job.stage == STAGE_AUTO_RECOVERY_QUERY) return 88;
   if (job.stage == STAGE_ABORTING || job.stage == STAGE_RECOVER_POWER_OFF ||
       job.stage == STAGE_RECOVER_BOOT) return 94;
   if (job.stage == STAGE_FORMAT || job.stage == STAGE_QUERY) return job.type == TASK_QUERY ? 55 : 88;
@@ -579,8 +645,13 @@ void operatorManagerLoop() {
   if (job.stage == STAGE_RECOVER_BOOT) {
     if (millis() - job.phaseAt >= 6500) {
       modemInit();
-      finishJob(false, recoveryMessage, recoveryError + "；模组已重新初始化");
-      operatorManagerInvalidate();
+      if ((job.type == TASK_SELECT || job.type == TASK_AUTO) && !job.recoveryRebooted) {
+        job.recoveryRebooted = true;
+        beginAutoRecovery(recoveryMessage, recoveryError + "；模组已重新初始化");
+      } else {
+        finishJob(false, recoveryMessage, recoveryError + "；模组已重新初始化");
+        operatorManagerInvalidate();
+      }
     }
     return;
   }
@@ -592,12 +663,31 @@ void operatorManagerLoop() {
     if (millis() - job.startedAt > taskTimeout()) {
       // The primary COPS command already returned a terminal OK before this
       // wait state, so there is no in-flight AT command to abort.
-      finishJob(false, "选网后网络注册超时", "请恢复自动选网或重新扫描后再试");
-      operatorManagerInvalidate();
+      if (job.type == TASK_SELECT) {
+        beginAutoRecovery("目标网络注册超时", "目标运营商在 120 秒内未完成注册");
+      } else {
+        finishJob(false, "选网后网络注册超时", "请重新扫描后再试");
+        operatorManagerInvalidate();
+      }
       return;
     }
     if (millis() - job.phaseAt >= 2500) {
       sendWireCommand("AT+CEREG?", STAGE_CEREG, "registering", "正在检查网络注册状态");
+    }
+    return;
+  }
+
+  if (job.stage == STAGE_AUTO_RECOVERY_WAIT) {
+    while (Serial1.available()) {
+      dispatchSerial1Byte(static_cast<char>(Serial1.read()), false);
+    }
+    if (millis() - job.recoveryStartedAt > SELECT_TIMEOUT_MS) {
+      beginRecovery("自动选网恢复超时", recoveryError + "；模组将安全重启");
+      return;
+    }
+    if (millis() - job.phaseAt >= 2500) {
+      sendWireCommand("AT+CEREG?", STAGE_AUTO_RECOVERY_CEREG, "recovering",
+                      "正在检查自动选网恢复状态");
     }
     return;
   }
@@ -614,6 +704,18 @@ void operatorManagerLoop() {
   }
 
   if (responseError(responseBuffer)) {
+    const bool autoRecovery = job.stage == STAGE_AUTO_RECOVERY ||
+                              job.stage == STAGE_AUTO_RECOVERY_CEREG ||
+                              job.stage == STAGE_AUTO_RECOVERY_FORMAT ||
+                              job.stage == STAGE_AUTO_RECOVERY_QUERY;
+    if (job.type == TASK_SELECT && !autoRecovery) {
+      beginAutoRecovery("目标网络拒绝选网命令", "当前 SIM 或 Profile 无法注册所选网络");
+      return;
+    }
+    if (autoRecovery) {
+      beginRecovery("自动选网恢复失败", recoveryError + "；模组将安全重启");
+      return;
+    }
     String detail = job.type == TASK_SCAN ? "当前 Profile 不允许扫描或模组扫描失败" : "运营商拒绝了选网命令";
     finishJob(false, "运营商操作失败", detail);
     return;
@@ -622,9 +724,21 @@ void operatorManagerLoop() {
     handleSuccessfulResponse();
     return;
   }
-  if ((job.type == TASK_SELECT || job.type == TASK_AUTO) &&
+  const bool autoRecovery = job.stage == STAGE_AUTO_RECOVERY ||
+                            job.stage == STAGE_AUTO_RECOVERY_CEREG ||
+                            job.stage == STAGE_AUTO_RECOVERY_FORMAT ||
+                            job.stage == STAGE_AUTO_RECOVERY_QUERY;
+  if ((job.type == TASK_SELECT || job.type == TASK_AUTO) && !autoRecovery &&
       millis() - job.startedAt > taskTimeout()) {
-    beginRecovery("选网后网络注册超时", "请恢复自动选网或重新扫描后再试");
+    if (job.type == TASK_SELECT) {
+      beginRecovery("手动选网命令超时", "模组未结束选网命令，将安全重启并恢复服务");
+    } else {
+      beginRecovery("选网后网络注册超时", "请重新扫描后再试");
+    }
+    return;
+  }
+  if (autoRecovery && millis() - job.recoveryStartedAt > SELECT_TIMEOUT_MS) {
+    beginRecovery("自动选网恢复超时", recoveryError + "；模组将安全重启");
     return;
   }
   if (millis() - job.commandStartedAt > taskTimeout()) {
@@ -669,9 +783,10 @@ bool operatorManagerStartSelect(const String& numeric, int act, String& message)
   if (!beginTask(TASK_SELECT, message)) return false;
   job.targetNumeric = numeric;
   job.targetAct = act;
-  // Mode 4 is manual selection with automatic fallback. The RAT is deliberately
-  // omitted so the modem can choose a permitted access technology for this PLMN.
-  String command = "AT+COPS=4,2,\"" + numeric + "\"";
+  // Mode 1 performs a real manual selection. If registration is rejected or
+  // times out, the state machine sends COPS=0 and verifies service recovery.
+  // AcT is omitted so ML307A/C/R/Y variants may choose a supported LTE mode.
+  String command = "AT+COPS=1,2,\"" + numeric + "\"";
   sendWireCommand(command, STAGE_PRIMARY, "selecting", "正在手动选择 " + (carrierName(numeric).length() ? carrierName(numeric) : numeric));
   message = "手动选网任务已开始";
   return true;
