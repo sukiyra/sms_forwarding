@@ -8,6 +8,10 @@ void esimManagerLoop();
 bool esimRefreshProfiles(String &error);
 bool esimProfilesLoaded();
 void esimManagerInvalidateProfiles();
+void esimManagerResetCapability();
+bool esimCapabilityKnown();
+bool esimIsSupported();
+const char* esimModeName();
 String esimProfilesJson();
 bool esimStartSwitch(const String &profileId, String &message);
 // Returns cached EID hex string, or empty string with error set.

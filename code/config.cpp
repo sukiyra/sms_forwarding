@@ -178,6 +178,10 @@ bool isPushChannelValid(const PushChannel& ch) {
     case PUSH_TYPE_FEISHU:
     case PUSH_TYPE_CUSTOM:
       return ch.url.length() > 0;
+    case PUSH_TYPE_WECOM:
+      return ch.url.startsWith("https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=") &&
+             ch.url.length() > strlen("https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=") &&
+             ch.url.indexOf(' ') < 0 && ch.url.indexOf('\r') < 0 && ch.url.indexOf('\n') < 0;
     case PUSH_TYPE_PUSHPLUS:
     case PUSH_TYPE_SERVERCHAN:
       return ch.key1.length() > 0;  // 这两个主要靠key1（token/sendkey）

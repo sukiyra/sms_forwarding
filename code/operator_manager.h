@@ -17,6 +17,9 @@ bool operatorManagerIsAutomaticSelection();
 
 String operatorManagerJson();
 String operatorCurrentLabel();
+String operatorCurrentNumeric();
+int operatorCurrentAct();
+String operatorCurrentActName();
 void operatorManagerInvalidate();
 
 #endif

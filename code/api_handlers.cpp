@@ -7,11 +7,58 @@
 #include "operator_manager.h"
 #include "push.h"
 #include "sim_manager.h"
+#include "sms_process.h"
 #include "sms_store.h"
 #include "web_handlers.h"
 
 namespace {
 
+enum OutboundSmsState {
+  OUTBOUND_IDLE,
+  OUTBOUND_QUEUED,
+  OUTBOUND_SENDING,
+  OUTBOUND_SUCCESS,
+  OUTBOUND_FAILED
+};
+
+OutboundSmsState outboundSmsState = OUTBOUND_IDLE;
+String outboundSmsPhone;
+String outboundSmsContent;
+String outboundSmsMessage = "尚未提交短信";
+unsigned long outboundSmsUpdatedAt = 0;
+bool outboundSmsProcessing = false;
+
+const char* outboundSmsStateName() {
+  switch (outboundSmsState) {
+    case OUTBOUND_QUEUED: return "queued";
+    case OUTBOUND_SENDING: return "sending";
+    case OUTBOUND_SUCCESS: return "success";
+    case OUTBOUND_FAILED: return "failed";
+    default: return "idle";
+  }
+}
+
+bool outboundSmsBusyInternal() {
+  return outboundSmsState == OUTBOUND_QUEUED || outboundSmsState == OUTBOUND_SENDING;
+}
+
+String outboundSmsJson() {
+  return "{\"ok\":true,\"state\":\"" + String(outboundSmsStateName()) +
+         "\",\"busy\":" + String(outboundSmsBusyInternal() ? "true" : "false") +
+         ",\"success\":" + String(outboundSmsState == OUTBOUND_SUCCESS ? "true" : "false") +
+         ",\"message\":\"" + jsonEscape(outboundSmsMessage) + "\",\"updatedAt\":" +
+         String(outboundSmsUpdatedAt / 1000) + "}";
+}
+
+bool validSmsPhone(const String& phone) {
+  if (phone.length() < 3 || phone.length() > 24) return false;
+  for (size_t i = 0; i < phone.length(); ++i) {
+    char c = phone.charAt(i);
+    if (c == '+' && i == 0) continue;
+    if (!isDigit(c)) return false;
+  }
+  return true;
+}
 
 
 bool validLength(const String &value, size_t maxLength) {
@@ -25,10 +72,19 @@ void handleApiStatus() {
     if (config.pushChannels[i].enabled) enabledPush++;
   }
   String activeProfile = esimActiveProfileLabel();
+  String esimSupportedJson = !esimCapabilityKnown()
+                                 ? "null"
+                                 : (esimIsSupported() ? "true" : "false");
   String networkOperator = operatorCurrentLabel();
+  String networkPlmn = operatorCurrentNumeric();
+  int networkAct = operatorCurrentAct();
+  String networkActName = operatorCurrentActName();
   if (!simManagerIsPresent()) {
     activeProfile = "";
     networkOperator = "";
+    networkPlmn = "";
+    networkAct = -1;
+    networkActName = "未知";
   }
   bool signalKnown = simManagerIsPresent() && simManagerSignalKnown();
   bool rsrqKnown = signalKnown && simManagerSignalRsrqKnown();
@@ -40,15 +96,17 @@ void handleApiStatus() {
   unsigned long signalUpdatedAt = signalKnown ? simManagerSignalUpdatedAt() : 0;
   unsigned long signalAge = signalKnown ? millis() - signalUpdatedAt : 0;
   String json;
-  json.reserve(1080);
-  json = "{\"ok\":true,\"uptime\":" + String(millis() / 1000) +
+  json.reserve(1400);
+  json = "{\"ok\":true,\"firmware\":\"" FIRMWARE_VERSION "\",\"uptime\":" + String(millis() / 1000) +
          ",\"heap\":" + String(ESP.getFreeHeap()) + ",\"epoch\":" + String(static_cast<unsigned long>(time(nullptr))) +
          ",\"wifi\":{\"connected\":" + String(WiFi.isConnected() ? "true" : "false") +
          ",\"ssid\":\"" + jsonEscape(WiFi.SSID()) + "\",\"rssi\":" + String(WiFi.RSSI()) +
          ",\"ip\":\"" + WiFi.localIP().toString() + "\"},\"modem\":{\"ready\":" +
-         String(modemReady ? "true" : "false") + ",\"model\":\"ML307R\",\"operator\":\"" +
+         String(modemReady ? "true" : "false") + ",\"model\":\"" + jsonEscape(detectedModemModel) + "\",\"operator\":\"" +
          jsonEscape(networkOperator) + "\",\"busy\":" +
          String(modemIsBusy() ? "true" : "false") +
+         ",\"plmn\":\"" + jsonEscape(networkPlmn) + "\",\"act\":" + String(networkAct) +
+         ",\"actName\":\"" + jsonEscape(networkActName) + "\"" +
          ",\"registration\":\"" + String(modemReady ? "已注册" : "未注册") +
          "\",\"rsrp\":" + rsrpJson + ",\"rsrq\":" + rsrqJson +
          ",\"signal\":{\"known\":" + String(signalKnown ? "true" : "false") +
@@ -59,13 +117,18 @@ void handleApiStatus() {
          ",\"present\":" + String(simManagerIsPresent() ? "true" : "false") +
          ",\"ready\":" + String(simManagerIsReady() ? "true" : "false") +
          ",\"smsReady\":" + String(simManagerSmsReady() ? "true" : "false") +
+         ",\"phoneNumber\":\"" + jsonEscape(simManagerPhoneNumber()) + "\"" +
+         ",\"iccidTail\":\"" + jsonEscape(simManagerIccidTail()) + "\"" +
+         ",\"mode\":\"" + String(esimModeName()) + "\",\"esimSupported\":" +
+         esimSupportedJson +
          ",\"message\":\"" + jsonEscape(simManagerMessage()) +
          "\",\"generation\":" + String(simManagerGeneration()) +
          ",\"changedAt\":" + String(simManagerChangedAt()) + ",\"profile\":\"" +
          jsonEscape(activeProfile) + "\",\"name\":\"" + jsonEscape(activeProfile) +
          "\",\"profileName\":\"" + jsonEscape(activeProfile) + "\"},\"sms\":{\"stored\":" + String(smsStoreCount()) +
          ",\"unread\":" + String(smsStoreUnread()) + ",\"capacity\":50},\"push\":{\"enabled\":" +
-         String(enabledPush) + "},\"job\":" + esimJobJson() + "}";
+         String(enabledPush) + "},\"job\":" + esimJobJson() +
+         ",\"outboundSms\":" + outboundSmsJson() + "}";
   sendJsonResponse(200, json);
 }
 
@@ -132,6 +195,10 @@ void handleApiEsimProfiles() {
   if (!esimProfilesLoaded() && !esimIsBusy()) {
     String error;
     if (!esimRefreshProfiles(error)) {
+      if (esimCapabilityKnown() && !esimIsSupported()) {
+        sendJsonResponse(200, esimProfilesJson());
+        return;
+      }
       sendJsonResponse(503, "{\"ok\":false,\"error\":\"esim\",\"message\":\"" + jsonEscape(error) + "\"}");
       return;
     }
@@ -149,8 +216,13 @@ void handleApiEsimRefresh() {
     sendJsonResponse(409, "{\"ok\":false,\"error\":\"modem_busy\",\"message\":\"模组正在处理其他通信，请稍后重试\"}");
     return;
   }
+  esimManagerResetCapability();
   String error;
   if (!esimRefreshProfiles(error)) {
+    if (esimCapabilityKnown() && !esimIsSupported()) {
+      sendJsonResponse(200, esimProfilesJson());
+      return;
+    }
     sendJsonResponse(503, "{\"ok\":false,\"error\":\"esim\",\"message\":\"" + jsonEscape(error) + "\"}");
     return;
   }
@@ -187,6 +259,10 @@ void handleApiEsimEid() {
     sendJsonResponse(200, "{\"ok\":true,\"eid\":\"\"}");
     return;
   }
+  if (esimCapabilityKnown() && !esimIsSupported()) {
+    sendJsonResponse(200, "{\"ok\":true,\"supported\":false,\"mode\":\"physical\",\"eid\":\"\",\"message\":\"实体 SIM 没有 EID\"}");
+    return;
+  }
   if (modemIsBusy()) {
     sendJsonResponse(409, "{\"ok\":false,\"error\":\"modem_busy\",\"message\":\"模组正在处理其他通信，请稍后重试\"}");
     return;
@@ -194,6 +270,10 @@ void handleApiEsimEid() {
   String error;
   String eid = esimGetEid(error);
   if (!eid.length()) {
+    if (esimCapabilityKnown() && !esimIsSupported()) {
+      sendJsonResponse(200, "{\"ok\":true,\"supported\":false,\"mode\":\"physical\",\"eid\":\"\",\"message\":\"实体 SIM 没有 EID\"}");
+      return;
+    }
     sendJsonResponse(503, "{\"ok\":false,\"error\":\"esim\",\"message\":\"" + jsonEscape(error) + "\"}");
     return;
   }
@@ -375,12 +455,13 @@ void handleApiSmsSend() {
     sendJsonResponse(409, "{\"ok\":false,\"message\":\"SIM 或短信服务尚未就绪\"}");
     return;
   }
-  if (esimIsBusy()) {
-    sendJsonResponse(409, "{\"ok\":false,\"message\":\"eSIM切换中，无法发送短信\"}");
+  if (outboundSmsBusyInternal()) {
+    sendJsonResponse(409, "{\"ok\":false,\"state\":\"" + String(outboundSmsStateName()) +
+                           "\",\"message\":\"上一条短信仍在发送，请稍候\"}");
     return;
   }
-  if (modemIsBusy()) {
-    sendJsonResponse(409, "{\"ok\":false,\"message\":\"模组正在初始化或处理其他通信，请稍后重试\"}");
+  if (esimIsBusy() || operatorManagerIsBusy()) {
+    sendJsonResponse(409, "{\"ok\":false,\"message\":\"SIM 或运营商任务正在执行，请稍后重试\"}");
     return;
   }
   String phone = server.arg("phone");
@@ -391,12 +472,26 @@ void handleApiSmsSend() {
     sendJsonResponse(400, "{\"ok\":false,\"message\":\"请填写目标号码和短信内容\"}");
     return;
   }
-  logCaptureLn(String("网页端发送短信请求"));
-  logCaptureLn(String("目标号码: " + phone));
-  logCaptureLn(String("短信内容: " + content));
-  bool ok = sendSMS(phone.c_str(), content.c_str());
-  sendJsonResponse(200, "{\"ok\":" + String(ok ? "true" : "false") +
-                    ",\"message\":\"" + jsonEscape(ok ? "短信发送成功" : "短信发送失败，请检查模组状态") + "\"}");
+  if (!validSmsPhone(phone)) {
+    sendJsonResponse(400, "{\"ok\":false,\"message\":\"目标号码格式不正确，只能包含数字和开头的 +\"}");
+    return;
+  }
+  if (content.length() > 1024) {
+    sendJsonResponse(400, "{\"ok\":false,\"message\":\"短信内容过长\"}");
+    return;
+  }
+  outboundSmsPhone = phone;
+  outboundSmsContent = content;
+  outboundSmsState = OUTBOUND_QUEUED;
+  outboundSmsMessage = "短信已提交，等待模组发送";
+  outboundSmsUpdatedAt = millis();
+  logCaptureLn("网页短信已入队");
+  sendJsonResponse(202, outboundSmsJson());
+}
+
+void handleApiSmsSendStatus() {
+  if (!authRequire()) return;
+  sendJsonResponse(200, outboundSmsJson());
 }
 
 void handleApiConfigGet() {
@@ -556,7 +651,7 @@ void handleApiConfigPost() {
                           server.hasArg(p + "body");
     if (!channelPresent) continue;
     config.pushChannels[i].enabled = server.hasArg(p + "en");
-    if (server.hasArg(p + "type")) config.pushChannels[i].type = static_cast<PushType>(constrain(server.arg(p + "type").toInt(), 0, 10));
+    if (server.hasArg(p + "type")) config.pushChannels[i].type = static_cast<PushType>(constrain(server.arg(p + "type").toInt(), 0, 11));
     if (server.hasArg(p + "name")) config.pushChannels[i].name = server.arg(p + "name").substring(0, 48);
     if (server.hasArg(p + "url") && server.arg(p + "url").length()) config.pushChannels[i].url = server.arg(p + "url").substring(0, 512);
     if (server.hasArg(p + "k1") && server.arg(p + "k1").length()) config.pushChannels[i].key1 = server.arg(p + "k1").substring(0, 256);
@@ -571,6 +666,37 @@ void handleApiConfigPost() {
 }
 
 }  // namespace
+
+bool pendingWebSmsBusy() {
+  return outboundSmsBusyInternal();
+}
+
+void processPendingWebSms() {
+  if (outboundSmsProcessing || outboundSmsState != OUTBOUND_QUEUED) return;
+  if (millis() - outboundSmsUpdatedAt < 100) return;
+  if (!simManagerIsReady() || !simManagerSmsReady()) {
+    outboundSmsPhone = "";
+    outboundSmsContent = "";
+    outboundSmsState = OUTBOUND_FAILED;
+    outboundSmsMessage = "SIM 或短信服务已变为不可用";
+    outboundSmsUpdatedAt = millis();
+    return;
+  }
+  if (esimIsBusy() || operatorManagerIsBusy() || simManagerIsBusy() ||
+      smsStoredMessageIsBusy() || modemIsBusy()) return;
+
+  outboundSmsProcessing = true;
+  outboundSmsState = OUTBOUND_SENDING;
+  outboundSmsMessage = "模组正在发送，通常需要数秒";
+  outboundSmsUpdatedAt = millis();
+  bool success = sendSMS(outboundSmsPhone.c_str(), outboundSmsContent.c_str());
+  outboundSmsPhone = "";
+  outboundSmsContent = "";
+  outboundSmsState = success ? OUTBOUND_SUCCESS : OUTBOUND_FAILED;
+  outboundSmsMessage = success ? "短信发送成功" : "短信发送失败，请查看诊断日志";
+  outboundSmsUpdatedAt = millis();
+  outboundSmsProcessing = false;
+}
 
 void registerApiRoutes() {
   server.on("/api/session", HTTP_GET, handleApiSession);
@@ -594,6 +720,8 @@ void registerApiRoutes() {
   server.on("/api/config", HTTP_POST, handleApiConfigPost);
   server.on("/api/wifi", HTTP_POST, handleApiWifiPost);
   server.on("/api/sms/send", HTTP_POST, handleApiSmsSend);
+  server.on("/api/sms/send/status", HTTP_GET, handleApiSmsSendStatus);
+  server.on("/sendsms", HTTP_POST, handleApiSmsSend);
   server.on("/api/reboot", handleApiReboot);
   server.on("/api/push/test", HTTP_POST, handleApiPushTest);
   server.on("/api/factory/reset", handleApiFactoryReset);

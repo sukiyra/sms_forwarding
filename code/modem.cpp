@@ -26,6 +26,12 @@ bool modemIsBooting() {
   return modemBooting;
 }
 
+bool modemSupportsPdpContextControl() {
+  // The ML307Y AT firmware used by this board does not safely support the
+  // CGACT context toggle used by ML307R-DC. SMS operation does not require it.
+  return !detectedModemModel.startsWith("ML307Y");
+}
+
 bool modemAcquireExclusive() {
   if (modemIsBusy()) return false;
   modemExclusive = true;
@@ -124,6 +130,9 @@ void modemInit() {
 
   //判断型号，做一些特定操作
   bool need_set_CGACT = true;
+  detectedModemManufacturer = "未知";
+  detectedModemModel = "ML307";
+  detectedModemFirmware = "未知";
   String resp = sendATCommand("ATI", 2000);
   logCaptureLn(String("ATI响应: " + resp));
   if (resp.indexOf("OK") >= 0) {
@@ -148,8 +157,11 @@ void modemInit() {
         lineStart = i + 1;
       }
     }
-    //这个模组这条命令有bug
-    if(model == "ML307Y") need_set_CGACT = false;
+    detectedModemManufacturer = manufacturer;
+    detectedModemModel = model;
+    detectedModemFirmware = version;
+    // ML307Y 的固件不安全支持该 PDP 上下文切换；短信无需数据上下文。
+    if (model.startsWith("ML307Y")) need_set_CGACT = false;
   }
 
   if(need_set_CGACT) {
@@ -165,7 +177,7 @@ void modemInit() {
     logCaptureLn(dataDisabled ? String("已禁用数据连接(AT+CGACT=0,1)，防止流量消耗")
                               : String("⚠️ 无法确认数据连接已禁用"));
   } else {
-    logCaptureLn(String("该型号无法配置(AT+CGACT=0,1)，跳过该命令，会不会消耗流量？自求多福"));
+    logCaptureLn(String("ML307Y 兼容模式：跳过 AT+CGACT=0,1，短信功能不受影响"));
   }
   String iccidResponse = sendATCommand("AT+ICCID", 2000);
   simManagerCaptureIccid(iccidResponse);
@@ -175,7 +187,7 @@ void modemInit() {
                    : String("⚠️ 暂未读取到接收卡 ICCID，短信来源将使用 Profile 回退标签"));
   bool cnmiReady = false;
   for (uint8_t attempt = 0; attempt < 5; ++attempt) {
-    if (sendATandWaitOK("AT+CNMI=2,2,0,0,0", 1200)) {
+    if (sendATandWaitOK("AT+CNMI=2,1,0,0,0", 1200)) {
       cnmiReady = true;
       break;
     }
@@ -270,13 +282,21 @@ bool sendSMS(const char* phoneNumber, const char* message) {
     logCaptureLn(String("模组正忙，暂不能发送短信"));
     return false;
   }
+  String normalizedPhone(phoneNumber);
+  // Mainland mobile numbers are commonly entered without a country code.
+  // Always use international format so roaming SIM SMSCs route them correctly.
+  if (normalizedPhone.length() == 11 && normalizedPhone.charAt(0) == '1') {
+    normalizedPhone = "+86" + normalizedPhone;
+  }
   logCaptureLn(String("准备发送短信..."));
-  logCapture(String("目标号码: ")); logCaptureLn(String(phoneNumber));
-  logCapture(String("短信内容: ")); logCaptureLn(String(message));
+  String maskedPhone(normalizedPhone);
+  if (maskedPhone.length() > 4) maskedPhone = "****" + maskedPhone.substring(maskedPhone.length() - 4);
+  logCapture(String("目标号码: ")); logCaptureLn(maskedPhone);
+  logCapture(String("短信内容长度: ")); logCaptureLn(String(strlen(message)) + " 字节");
 
   // 使用pdulib编码PDU
   pdu.setSCAnumber();  // 使用默认短信中心
-  int pduLen = pdu.encodePDU(phoneNumber, message);
+  int pduLen = pdu.encodePDU(normalizedPhone.c_str(), message);
   
   if (pduLen < 0) {
     logCapture(String("PDU编码失败，错误码: "));
@@ -284,7 +304,6 @@ bool sendSMS(const char* phoneNumber, const char* message) {
     return false;
   }
   
-  logCapture(String("PDU数据: ")); logCaptureLn(String(pdu.getSMS()));
   logCapture(String("PDU长度: ")); logCaptureLn(String(pduLen));
   
   // 发送AT+CMGS命令
@@ -309,6 +328,7 @@ bool sendSMS(const char* phoneNumber, const char* message) {
       }
     }
     server.handleClient();
+    delay(1);
   }
   
   if (!gotPrompt) {
@@ -342,6 +362,7 @@ bool sendSMS(const char* phoneNumber, const char* message) {
       }
     }
     server.handleClient();
+    delay(1);
   }
   logCaptureLn(String("短信发送超时"));
   endModemTransaction();

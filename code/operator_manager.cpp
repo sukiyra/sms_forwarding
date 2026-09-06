@@ -711,6 +711,18 @@ String operatorCurrentLabel() {
   return "";
 }
 
+String operatorCurrentNumeric() {
+  return currentOperator.numeric;
+}
+
+int operatorCurrentAct() {
+  return currentOperator.act;
+}
+
+String operatorCurrentActName() {
+  return actName(currentOperator.act);
+}
+
 String operatorManagerJson() {
   bool cacheFresh = networksUpdatedAt && millis() - networksUpdatedAt <= SCAN_CACHE_MS;
   String json;

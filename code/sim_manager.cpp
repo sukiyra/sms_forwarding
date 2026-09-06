@@ -12,6 +12,7 @@ namespace {
 constexpr unsigned long DETECT_INTERVAL_READY_MS = 2000UL;
 constexpr unsigned long DETECT_INTERVAL_RETRY_MS = 1000UL;
 constexpr unsigned long DETECT_CONFIRM_MS = 350UL;
+constexpr unsigned long ML307Y_ABSENT_CONFIRM_MS = 3000UL;
 constexpr unsigned long COMMAND_TIMEOUT_MS = 2500UL;
 constexpr unsigned long CGACT_TIMEOUT_MS = 5000UL;
 constexpr unsigned long SIGNAL_INTERVAL_MS = 10000UL;
@@ -46,11 +47,14 @@ enum WireStage {
   WIRE_CMEE,
   WIRE_CGACT,
   WIRE_ICCID,
+  WIRE_ICCID_CRSM,
+  WIRE_CNUM,
   WIRE_CNMI,
   WIRE_CMGF,
   WIRE_CEREG_ENABLE,
   WIRE_CEREG_QUERY,
   WIRE_CEREG_PROBE,
+  WIRE_CEREG_SIM_VERIFY,
   WIRE_CESQ
 };
 
@@ -66,6 +70,7 @@ bool ownsExclusive = false;
 bool probeRegistrationNext = false;
 uint8_t configAttempts = 0;
 uint8_t transportFailures = 0;
+uint8_t ml307yAbsentVerificationFailures = 0;
 uint32_t generation = 0;
 unsigned long changedAt = 0;
 unsigned long nextActionAt = 0;
@@ -74,10 +79,13 @@ unsigned long commandTimeout = COMMAND_TIMEOUT_MS;
 char responseBuffer[RESPONSE_CAPACITY];
 size_t responseLength = 0;
 String activeIccidTail;
+String activePhoneNumber;
 bool signalKnown = false;
 bool signalRsrqKnown = false;
 int signalRsrpDbm = 0;
 int signalRsrqTenthsDb = 0;
+bool startWire(const char* command, WireStage stage,
+               unsigned long timeout = COMMAND_TIMEOUT_MS);
 int signalRsrpRaw = -1;
 int signalRsrqRaw = -1;
 unsigned long signalUpdatedAt = 0;
@@ -244,6 +252,64 @@ String parseIccidTail(const char* response) {
   return tail;
 }
 
+String parseCrsmIccidTail(const char* response) {
+  if (!response) return "";
+  const char* marker = strstr(response, "+CRSM:");
+  if (!marker) return "";
+  marker = strchr(marker, '"');
+  if (!marker) return "";
+  ++marker;
+  const char* end = strchr(marker, '"');
+  if (!end || end - marker != 20) return "";
+
+  String digits;
+  digits.reserve(20);
+  for (const char* p = marker; p < end; p += 2) {
+    if (!isHexadecimalDigit(p[0]) || !isHexadecimalDigit(p[1])) return "";
+    digits += p[1];
+    digits += p[0];
+  }
+  if (digits.endsWith("F") || digits.endsWith("f")) digits.remove(digits.length() - 1);
+  if (digits.length() < 18 || digits.length() > 20) return "";
+  for (size_t i = 0; i < digits.length(); ++i) {
+    if (!isDigit(digits[i])) return "";
+  }
+  return digits.substring(digits.length() - 4);
+}
+
+String parsePhoneNumber(const char* response) {
+  if (!response) return "";
+  const char* marker = strstr(response, "+CNUM:");
+  if (!marker) return "";
+  marker = strchr(marker, ',');
+  if (!marker) return "";
+  ++marker;
+  while (*marker == ' ' || *marker == '\t') ++marker;
+
+  const char* end = marker;
+  if (*marker == '"') {
+    ++marker;
+    end = strchr(marker, '"');
+  } else {
+    while (*end && *end != ',' && *end != '\r' && *end != '\n') ++end;
+  }
+  if (!end || end <= marker) return "";
+
+  String number;
+  number.reserve(static_cast<size_t>(end - marker));
+  for (const char* p = marker; p < end; ++p) {
+    if (*p == '+' && p == marker) {
+      number += *p;
+    } else if (isDigit(*p)) {
+      number += *p;
+    } else if (*p != ' ' && *p != '-') {
+      return "";
+    }
+  }
+  size_t digits = number.startsWith("+") ? number.length() - 1 : number.length();
+  return digits >= 3 && digits <= 20 ? number : "";
+}
+
 void clearSignalCache() {
   signalKnown = false;
   signalRsrqKnown = false;
@@ -284,8 +350,9 @@ void invalidateCardCaches() {
   smsReady = false;
   probeRegistrationNext = false;
   activeIccidTail = "";
+  activePhoneNumber = "";
   clearSignalCache();
-  esimManagerInvalidateProfiles();
+  esimManagerResetCapability();
   operatorManagerInvalidate();
   smsResetForSimChange();
 }
@@ -337,7 +404,7 @@ void commitObservation(Observation observation) {
       if (newlyReady) {
         modemReady = false;
         smsReady = false;
-        esimManagerInvalidateProfiles();
+        esimManagerResetCapability();
         operatorManagerInvalidate();
         needsConfigure = true;
         configAttempts = 0;
@@ -355,6 +422,9 @@ void commitObservation(Observation observation) {
 }
 
 void observe(Observation observation) {
+  bool verifyMl307yAbsent = observation == OBS_ABSENT &&
+                           detectedModemModel.startsWith("ML307Y");
+  if (observation != OBS_ABSENT) ml307yAbsentVerificationFailures = 0;
   if (observation == OBS_UNKNOWN) {
     candidate = OBS_UNKNOWN;
     candidateCount = 0;
@@ -393,7 +463,7 @@ void observe(Observation observation) {
     // A first definitive change immediately withdraws READY and invalidates
     // card-derived caches. The second sample still decides the final state,
     // but a quick remove/reinsert can no longer leave stale Profile data live.
-    if (state != SIM_UNKNOWN && state != SIM_DETECTING) {
+    if (!verifyMl307yAbsent && state != SIM_UNKNOWN && state != SIM_DETECTING) {
       invalidateCardCaches();
       needsConfigure = false;
       configAttempts = 0;
@@ -402,11 +472,24 @@ void observe(Observation observation) {
   } else if (candidateCount < 255) {
     ++candidateCount;
   }
-  if (candidateCount >= CONFIRMATION_COUNT) commitObservation(observation);
-  else nextActionAt = millis() + DETECT_CONFIRM_MS;
+  if (candidateCount >= CONFIRMATION_COUNT) {
+    // ML307Y can briefly (and sometimes persistently after COPS scans) return
+    // CME 10 while it remains registered. Confirm that contradiction through
+    // CEREG before withdrawing a working SIM and its SMS service.
+    if (verifyMl307yAbsent) {
+      if (!startWire("AT+CEREG?", WIRE_CEREG_SIM_VERIFY)) {
+        nextActionAt = millis() + ML307Y_ABSENT_CONFIRM_MS;
+      }
+      return;
+    }
+    commitObservation(observation);
+  } else {
+    nextActionAt = millis() +
+                   (verifyMl307yAbsent ? ML307Y_ABSENT_CONFIRM_MS : DETECT_CONFIRM_MS);
+  }
 }
 
-bool startWire(const char* command, WireStage stage, unsigned long timeout = COMMAND_TIMEOUT_MS) {
+bool startWire(const char* command, WireStage stage, unsigned long timeout) {
   if (wireStage != WIRE_IDLE || esimIsBusy() || operatorManagerIsBusy() ||
       smsReceiverAwaitingPdu()) return false;
   if (!modemAcquireExclusive()) return false;
@@ -450,6 +533,37 @@ void handleWireResult(WireStage completed, bool ok) {
     return;
   }
 
+  if (completed == WIRE_CEREG_SIM_VERIFY) {
+    int registration = ok ? parseCeregStatus() : -1;
+    releaseWire();
+    if (registration == 1 || registration == 5) {
+      bool wasReady = state == SIM_READY && smsReady;
+      candidate = OBS_UNKNOWN;
+      candidateCount = 0;
+      ml307yAbsentVerificationFailures = 0;
+      transportFailures = 0;
+      modemReady = true;
+      if (wasReady) {
+        nextActionAt = millis() + DETECT_INTERVAL_READY_MS;
+      } else {
+        logCaptureLn("ML307Y CPIN 报未插卡，但蜂窝仍已注册；按在卡状态恢复短信服务");
+        needsConfigure = true;
+        configAttempts = 0;
+        publishState(SIM_DETECTING, true, true);
+        nextActionAt = millis();
+      }
+      return;
+    }
+    candidate = OBS_UNKNOWN;
+    candidateCount = 0;
+    if (registration >= 0 && ++ml307yAbsentVerificationFailures >= 3) {
+      commitObservation(OBS_ABSENT);
+    } else {
+      nextActionAt = millis() + ML307Y_ABSENT_CONFIRM_MS;
+    }
+    return;
+  }
+
   if (completed == WIRE_CEREG_PROBE) {
     int registration = ok ? parseCeregStatus() : -1;
     releaseWire();
@@ -488,13 +602,25 @@ void handleWireResult(WireStage completed, bool ok) {
       // ICCID is receiver metadata only. Never block SMS recovery when a
       // modem temporarily refuses this optional query.
       activeIccidTail = "";
-      startWire("AT+CNMI=2,2,0,0,0", WIRE_CNMI);
+      startWire("AT+CRSM=176,12258,0,0,10,,\"3F00\"", WIRE_ICCID_CRSM);
+    } else if (completed == WIRE_ICCID_CRSM) {
+      activeIccidTail = "";
+      startWire("AT+CNUM", WIRE_CNUM);
+    } else if (completed == WIRE_CNUM) {
+      // Many operators do not provision MSISDN on the SIM. Treat an empty or
+      // unsupported CNUM response as normal and continue SMS configuration.
+      activePhoneNumber = "";
+      startWire("AT+CNMI=2,1,0,0,0", WIRE_CNMI);
     } else if (completed == WIRE_CMEE) {
       // During insertion recovery CMEE is best effort and configuration may
       // continue. During ordinary detection, retry CMEE later so a modem that
       // currently returns bare ERROR can recover numeric SIM diagnostics.
       if (needsConfigure) {
-        startWire("AT+CGACT=0,1", WIRE_CGACT, CGACT_TIMEOUT_MS);
+        if (modemSupportsPdpContextControl()) {
+          startWire("AT+CGACT=0,1", WIRE_CGACT, CGACT_TIMEOUT_MS);
+        } else {
+          startWire("AT+ICCID", WIRE_ICCID);
+        }
       } else {
         nextActionAt = millis() + DETECT_INTERVAL_RETRY_MS;
       }
@@ -506,11 +632,17 @@ void handleWireResult(WireStage completed, bool ok) {
 
   int registration = completed == WIRE_CEREG_QUERY ? parseCeregStatus() : -1;
   String iccidTail = completed == WIRE_ICCID ? parseIccidTail(responseBuffer) : "";
+  String crsmIccidTail = completed == WIRE_ICCID_CRSM ? parseCrsmIccidTail(responseBuffer) : "";
+  String phoneNumber = completed == WIRE_CNUM ? parsePhoneNumber(responseBuffer) : "";
   releaseWire();
   switch (completed) {
     case WIRE_CMEE:
       if (needsConfigure) {
-        startWire("AT+CGACT=0,1", WIRE_CGACT, CGACT_TIMEOUT_MS);
+        if (modemSupportsPdpContextControl()) {
+          startWire("AT+CGACT=0,1", WIRE_CGACT, CGACT_TIMEOUT_MS);
+        } else {
+          startWire("AT+ICCID", WIRE_ICCID);
+        }
       } else {
         transportFailures = 0;
         nextActionAt = millis();
@@ -521,7 +653,19 @@ void handleWireResult(WireStage completed, bool ok) {
       break;
     case WIRE_ICCID:
       activeIccidTail = iccidTail;
-      startWire("AT+CNMI=2,2,0,0,0", WIRE_CNMI);
+      if (!activeIccidTail.length()) {
+        startWire("AT+CRSM=176,12258,0,0,10,,\"3F00\"", WIRE_ICCID_CRSM);
+        break;
+      }
+      startWire("AT+CNUM", WIRE_CNUM);
+      break;
+    case WIRE_ICCID_CRSM:
+      activeIccidTail = crsmIccidTail;
+      startWire("AT+CNUM", WIRE_CNUM);
+      break;
+    case WIRE_CNUM:
+      activePhoneNumber = phoneNumber;
+      startWire("AT+CNMI=2,1,0,0,0", WIRE_CNMI);
       break;
     case WIRE_CNMI:
       startWire("AT+CMGF=0", WIRE_CMGF);
@@ -564,11 +708,21 @@ void drainWire() {
         nextActionAt = millis() + DETECT_INTERVAL_READY_MS;
       } else if (completed == WIRE_CESQ) {
         signalNextAt = millis() + SIGNAL_INTERVAL_MS;
+      } else if (completed == WIRE_CEREG_SIM_VERIFY) {
+        candidate = OBS_UNKNOWN;
+        candidateCount = 0;
+        nextActionAt = millis() + ML307Y_ABSENT_CONFIRM_MS;
       } else if (completed == WIRE_CGACT) {
         startWire("AT+ICCID", WIRE_ICCID);
       } else if (completed == WIRE_ICCID) {
         activeIccidTail = "";
-        startWire("AT+CNMI=2,2,0,0,0", WIRE_CNMI);
+        startWire("AT+CRSM=176,12258,0,0,10,,\"3F00\"", WIRE_ICCID_CRSM);
+      } else if (completed == WIRE_ICCID_CRSM) {
+        activeIccidTail = "";
+        startWire("AT+CNUM", WIRE_CNUM);
+      } else if (completed == WIRE_CNUM) {
+        activePhoneNumber = "";
+        startWire("AT+CNMI=2,1,0,0,0", WIRE_CNMI);
       } else if (completed == WIRE_CMEE && !needsConfigure) {
         nextActionAt = millis() + DETECT_INTERVAL_RETRY_MS;
       } else {
@@ -593,11 +747,21 @@ void drainWire() {
       nextActionAt = millis() + DETECT_INTERVAL_READY_MS;
     } else if (completed == WIRE_CESQ) {
       signalNextAt = millis() + SIGNAL_INTERVAL_MS;
+    } else if (completed == WIRE_CEREG_SIM_VERIFY) {
+      candidate = OBS_UNKNOWN;
+      candidateCount = 0;
+      nextActionAt = millis() + ML307Y_ABSENT_CONFIRM_MS;
     } else if (completed == WIRE_CGACT) {
       startWire("AT+ICCID", WIRE_ICCID);
     } else if (completed == WIRE_ICCID) {
       activeIccidTail = "";
-      startWire("AT+CNMI=2,2,0,0,0", WIRE_CNMI);
+      startWire("AT+CRSM=176,12258,0,0,10,,\"3F00\"", WIRE_ICCID_CRSM);
+    } else if (completed == WIRE_ICCID_CRSM) {
+      activeIccidTail = "";
+      startWire("AT+CNUM", WIRE_CNUM);
+    } else if (completed == WIRE_CNUM) {
+      activePhoneNumber = "";
+      startWire("AT+CNMI=2,1,0,0,0", WIRE_CNMI);
     } else if (completed == WIRE_CMEE && !needsConfigure) {
       nextActionAt = millis() + DETECT_INTERVAL_RETRY_MS;
     } else {
@@ -621,7 +785,10 @@ void simManagerBegin() {
   probeRegistrationNext = false;
   configAttempts = 0;
   transportFailures = 0;
+  ml307yAbsentVerificationFailures = 0;
   modemReady = false;
+  activeIccidTail = "";
+  activePhoneNumber = "";
   clearSignalCache();
   generation = 1;
   changedAt = millis();
@@ -633,6 +800,7 @@ void simManagerInvalidate() {
   candidate = OBS_UNKNOWN;
   candidateCount = 0;
   transportFailures = 0;
+  ml307yAbsentVerificationFailures = 0;
   needsConfigure = false;
   configAttempts = 0;
   invalidateCardCaches();
@@ -693,6 +861,10 @@ bool simManagerSmsReady() {
 
 String simManagerIccidTail() {
   return activeIccidTail;
+}
+
+String simManagerPhoneNumber() {
+  return activePhoneNumber;
 }
 
 void simManagerCaptureIccid(const String &response) {

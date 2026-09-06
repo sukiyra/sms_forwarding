@@ -25,6 +25,7 @@
 #define SERIAL_BUFFER_SIZE 500
 #define MODEM_RX_BUFFER_SIZE 8192
 #define MAX_PDU_LENGTH 300
+#define FIRMWARE_VERSION "sukiyra-1.1.0"
 
 // 全局变量声明
 extern Config config;
@@ -35,6 +36,9 @@ extern SMTPClient smtp;
 extern WebServer server;
 extern bool configValid;
 extern bool modemReady;
+extern String detectedModemManufacturer;
+extern String detectedModemModel;
+extern String detectedModemFirmware;
 extern unsigned long lastPrintTime;
 extern ConcatSms concatBuffer[MAX_CONCAT_MESSAGES];
 

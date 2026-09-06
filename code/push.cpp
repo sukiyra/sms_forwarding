@@ -2,6 +2,7 @@
 #include "web_handlers.h"
 #include "config.h"
 #include "web_handlers.h"
+#include "push_protocol.h"
 #include <HTTPClient.h>
 #include <mbedtls/md.h>
 #include <base64.h>
@@ -112,7 +113,7 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
   // 对于某些推送方式，URL可以为空（使用默认URL）
   bool needUrl = (channel.type == PUSH_TYPE_POST_JSON || channel.type == PUSH_TYPE_BARK || 
                   channel.type == PUSH_TYPE_GET || channel.type == PUSH_TYPE_DINGTALK || 
-                  channel.type == PUSH_TYPE_CUSTOM);
+                  channel.type == PUSH_TYPE_CUSTOM || channel.type == PUSH_TYPE_WECOM);
   if (needUrl && channel.url.length() == 0) return;
   
   HTTPClient http;
@@ -290,6 +291,39 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
       logCaptureLn(String("飞书: " + jsonData));
       httpCode = http.POST(jsonData);
       break;
+    }
+
+    case PUSH_TYPE_WECOM: {
+      if (!pushprotocol::isWecomWebhook(channel.url.c_str())) {
+        logCaptureLn("企业微信 Webhook 地址无效");
+        return;
+      }
+      auto payloads = pushprotocol::wecomPayloads(sender, message, timestamp);
+      if (payloads.empty()) {
+        logCaptureLn("企业微信消息编码失败");
+        return;
+      }
+      for (size_t i = 0; i < payloads.size(); ++i) {
+        HTTPClient wecom;
+        wecom.setConnectTimeout(5000);
+        wecom.setTimeout(5000);
+        wecom.setReuse(false);
+        if (!wecom.begin(channel.url)) {
+          logCaptureLn("企业微信连接初始化失败");
+          return;
+        }
+        wecom.addHeader("Content-Type", "application/json; charset=utf-8");
+        int code = wecom.POST(String(payloads[i].c_str()));
+        String response;
+        if (code > 0 && wecom.getSize() <= 4096) response = wecom.getString();
+        wecom.end();
+        auto result = pushprotocol::evaluateResponse(code, response.c_str(), true);
+        logCaptureF("[企业微信] 第 %u/%u 段 HTTP %d，%s：%s\n",
+                    unsigned(i + 1), unsigned(payloads.size()), code,
+                    result.ok ? "投递成功" : "投递失败", result.detail.c_str());
+        if (!result.ok) return;
+      }
+      return;
     }
     
     case PUSH_TYPE_GOTIFY: {

@@ -13,6 +13,7 @@ void blink_short(unsigned long gap_time = 500);
 bool sendSMS(const char* phoneNumber, const char* message);
 bool modemIsBusy();
 bool modemIsBooting();
+bool modemSupportsPdpContextControl();
 bool modemAcquireExclusive();
 void modemReleaseExclusive();
 

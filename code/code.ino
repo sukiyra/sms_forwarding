@@ -123,7 +123,10 @@ void loop() {
     if (Serial.available()) Serial1.write(Serial.read());
     checkSerial1URC();
   }
-  if (schedulerTickDue()) {
+  // Web requests only enqueue outbound SMS so the browser gets an immediate
+  // response. Run the modem transaction after URCs and SIM work are drained.
+  processPendingWebSms();
+  if (schedulerTickDue() && !pendingWebSmsBusy()) {
     checkCustomTasks();
   }
   checkWifiFailover();

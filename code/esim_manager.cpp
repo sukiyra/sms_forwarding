@@ -189,6 +189,30 @@ enum IsdrTransport {
 };
 uint8_t isdrTransport = TRANSPORT_CGLA;
 
+enum EsimCapability {
+  ESIM_CAPABILITY_UNKNOWN,
+  ESIM_CAPABILITY_SUPPORTED,
+  ESIM_CAPABILITY_UNSUPPORTED
+};
+
+EsimCapability esimCapability = ESIM_CAPABILITY_UNKNOWN;
+unsigned long capabilityCheckedAt = 0;
+bool profileListLoaded = false;
+
+void markEsimSupported() {
+  esimCapability = ESIM_CAPABILITY_SUPPORTED;
+  capabilityCheckedAt = millis();
+}
+
+void markPhysicalSim() {
+  if (esimCapability != ESIM_CAPABILITY_UNSUPPORTED) {
+    logCaptureLn("未检测到 eUICC 卡功能，已切换为实体 SIM 模式");
+  }
+  esimCapability = ESIM_CAPABILITY_UNSUPPORTED;
+  capabilityCheckedAt = millis();
+  profileListLoaded = false;
+}
+
 // AT+CSIM 透传:响应引号内为 <data><SW>
 bool csimExchange(const String &apdu, String &data, uint16_t &status, String &error) {
   data = "";
@@ -214,13 +238,17 @@ bool csimExchange(const String &apdu, String &data, uint16_t &status, String &er
 }
 
 bool openIsdr(int &channel, String &error) {
+  if (esimCapability == ESIM_CAPABILITY_UNSUPPORTED) {
+    error = "当前为实体 SIM，不支持 eSIM 卡功能";
+    return false;
+  }
   String response = sendATCommand(("AT+CCHO=\"" + String(ISDR_AID) + "\"").c_str(), 5000);
   channel = parseChannel(response);
   if (channel > 0) {
     isdrTransport = TRANSPORT_CGLA;
+    markEsimSupported();
     return true;
   }
-  logCaptureLn(String("CCHO 打开 ISD-R 失败，降级 CSIM 逻辑通道"));
 
   String data;
   uint16_t status = 0;
@@ -236,6 +264,7 @@ bool openIsdr(int &channel, String &error) {
         if (status == 0x9000) {
           channel = ch;
           isdrTransport = TRANSPORT_CSIM_LOGICAL;
+          markEsimSupported();
           return true;
         }
       }
@@ -245,8 +274,6 @@ bool openIsdr(int &channel, String &error) {
       csimExchange("00708000" + hexByte(ch), closeData, closeStatus, closeError);
     }
   }
-  logCaptureLn(String("CSIM 逻辑通道失败，降级 CSIM 基础通道"));
-
   if (csimExchange("00A4040010" + String(ISDR_AID), data, status, error)) {
     if ((status >> 8) == 0x61) {
       csimExchange("00C00000" + hexByte(status & 0xff), data, status, error);
@@ -255,10 +282,14 @@ bool openIsdr(int &channel, String &error) {
     if (status == 0x9000) {
       channel = 0;
       isdrTransport = TRANSPORT_CSIM_BASIC;
+      markEsimSupported();
       return true;
     }
   }
-  error = "无法打开 eUICC ISD-R 通道(CCHO 与 CSIM 均失败)";
+  if (esimCapability == ESIM_CAPABILITY_UNKNOWN) markPhysicalSim();
+  error = esimCapability == ESIM_CAPABILITY_UNSUPPORTED
+              ? "当前为实体 SIM，不支持 eSIM 卡功能"
+              : "eUICC 暂时无响应，请稍后重试";
   return false;
 }
 
@@ -390,6 +421,7 @@ bool readProfiles(String &error) {
     return false;
   }
   bool parsed = parseProfiles(data, error);
+  if (parsed) profileListLoaded = true;
   profileIoBusy = false;
   return parsed;
 }
@@ -483,6 +515,10 @@ void esimManagerBegin() {
 
 String esimGetEid(String &error) {
   if (eidValid) return cachedEid;
+  if (esimCapability == ESIM_CAPABILITY_UNSUPPORTED) {
+    error = "实体 SIM 没有 EID";
+    return "";
+  }
   if (!simManagerIsReady()) {
     error = "SIM 尚未就绪";
     return "";
@@ -533,6 +569,10 @@ String esimGetEid(String &error) {
 }
 
 bool esimDeleteProfile(const String &profileId, String &message) {
+  if (esimCapability == ESIM_CAPABILITY_UNSUPPORTED) {
+    message = "实体 SIM 没有可删除的 eSIM Profile";
+    return false;
+  }
   if (!simManagerIsReady()) {
     message = "SIM 尚未就绪";
     return false;
@@ -614,6 +654,10 @@ bool esimRefreshProfiles(String &error) {
     error = "eSIM 正在切换";
     return false;
   }
+  if (esimCapability == ESIM_CAPABILITY_UNSUPPORTED) {
+    error = "当前为实体 SIM，不支持 eSIM 卡功能";
+    return false;
+  }
   return readProfiles(error);
 }
 
@@ -622,7 +666,19 @@ String esimProfilesJson() {
   for (uint8_t i = 0; i < profileCount; ++i) {
     if (profiles[i].enabled) activeId = profiles[i].id;
   }
-  String json = "{\"ok\":true,\"supported\":true,\"updatedAt\":" + String(profilesUpdatedAt) +
+  String supported = esimCapability == ESIM_CAPABILITY_SUPPORTED
+                         ? "true"
+                         : (esimCapability == ESIM_CAPABILITY_UNSUPPORTED ? "false" : "null");
+  String message = esimCapability == ESIM_CAPABILITY_UNSUPPORTED
+                       ? "实体 SIM 已识别，短信收发与运营商选网可正常使用"
+                       : (esimCapability == ESIM_CAPABILITY_SUPPORTED
+                              ? "eSIM 卡功能已识别"
+                              : "等待识别 SIM 卡类型");
+  String json = "{\"ok\":true,\"supported\":" + supported + ",\"mode\":\"" +
+                esimModeName() + "\",\"message\":\"" + jsonEscape(message) +
+                "\",\"iccidTail\":\"" + jsonEscape(simManagerIccidTail()) +
+                "\",\"capabilityCheckedAt\":" + String(capabilityCheckedAt) +
+                ",\"updatedAt\":" + String(profilesUpdatedAt) +
                 ",\"activeId\":\"" + activeId + "\",\"switching\":" +
                 String(job.active ? "true" : "false") + ",\"profiles\":[";
   for (uint8_t i = 0; i < profileCount; ++i) {
@@ -640,7 +696,7 @@ String esimProfilesJson() {
 }
 
 bool esimProfilesLoaded() {
-  return profileCount > 0;
+  return esimCapability == ESIM_CAPABILITY_UNSUPPORTED || profileListLoaded;
 }
 
 void esimManagerInvalidateProfiles() {
@@ -648,11 +704,37 @@ void esimManagerInvalidateProfiles() {
   for (uint8_t i = 0; i < MAX_ESIM_PROFILES; ++i) profiles[i] = EsimProfile();
   profileCount = 0;
   profilesUpdatedAt = 0;
+  profileListLoaded = false;
   cachedEid = "";
   eidValid = false;
 }
 
+void esimManagerResetCapability() {
+  if (profileIoBusy || esimIsBusy()) return;
+  esimManagerInvalidateProfiles();
+  esimCapability = ESIM_CAPABILITY_UNKNOWN;
+  capabilityCheckedAt = 0;
+}
+
+bool esimCapabilityKnown() {
+  return esimCapability != ESIM_CAPABILITY_UNKNOWN;
+}
+
+bool esimIsSupported() {
+  return esimCapability == ESIM_CAPABILITY_SUPPORTED;
+}
+
+const char* esimModeName() {
+  if (esimCapability == ESIM_CAPABILITY_SUPPORTED) return "esim";
+  if (esimCapability == ESIM_CAPABILITY_UNSUPPORTED) return "physical";
+  return "unknown";
+}
+
 bool esimStartSwitch(const String &profileId, String &message) {
+  if (esimCapability == ESIM_CAPABILITY_UNSUPPORTED) {
+    message = "实体 SIM 没有可切换的 eSIM Profile";
+    return false;
+  }
   if (!simManagerIsReady()) {
     message = "SIM 尚未就绪";
     return false;
@@ -781,10 +863,12 @@ void esimManagerLoop() {
       job.lastAttemptAt = now;
       ++configureAttempts;
       sendATandWaitOK("AT+CMEE=1", 1200);
-      sendATandWaitOK("AT+CGACT=0,1", 3000);
+      if (modemSupportsPdpContextControl()) {
+        sendATandWaitOK("AT+CGACT=0,1", 3000);
+      }
       String iccidResponse = sendATCommand("AT+ICCID", 1800);
       simManagerCaptureIccid(iccidResponse);
-      bool cnmi = sendATandWaitOK("AT+CNMI=2,2,0,0,0", 1500);
+      bool cnmi = sendATandWaitOK("AT+CNMI=2,1,0,0,0", 1500);
       bool pdu = sendATandWaitOK("AT+CMGF=0", 1500);
       if (!cnmi || !pdu) {
         if (configureAttempts < 3) {
@@ -898,6 +982,7 @@ String esimActiveProfileLabel() {
     if (profiles[i].name.length()) return profiles[i].name;
     if (profiles[i].provider.length()) return profiles[i].provider;
   }
+  if (esimCapability == ESIM_CAPABILITY_UNSUPPORTED && simManagerIsReady()) return "实体 SIM";
   return "";
 }
 
@@ -920,6 +1005,7 @@ String esimActiveProfileSmsLabel() {
   }
   String tail = simManagerIccidTail();
   if (tail.length() == 4) return String("SIM · 尾号 ") + tail;
+  if (esimCapability == ESIM_CAPABILITY_UNSUPPORTED) return "实体 SIM";
   return "接收卡未识别";
 }
 

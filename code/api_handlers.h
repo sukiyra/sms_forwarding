@@ -4,5 +4,7 @@
 #include "globals.h"
 
 void registerApiRoutes();
+void processPendingWebSms();
+bool pendingWebSmsBusy();
 
 #endif

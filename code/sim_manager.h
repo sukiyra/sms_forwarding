@@ -13,6 +13,7 @@ bool simManagerIsPresent();
 bool simManagerIsReady();
 bool simManagerSmsReady();
 String simManagerIccidTail();
+String simManagerPhoneNumber();
 void simManagerCaptureIccid(const String &response);
 bool simManagerSignalKnown();
 bool simManagerSignalRsrqKnown();

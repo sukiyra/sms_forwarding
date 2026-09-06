@@ -674,6 +674,11 @@ void handlePing() {
     server.send(409, "application/json", "{\"success\":false,\"message\":\"eSIM切换中，无法执行 Ping\"}");
     return;
   }
+  if (!modemSupportsPdpContextControl()) {
+    server.send(409, "application/json",
+                "{\"success\":false,\"message\":\"当前 ML307Y 固件不安全支持 PDP 上下文开关，已禁用 Ping 流量测试\"}");
+    return;
+  }
   if (!requireModemRouteReady()) return;
   
   logCaptureLn(String("网页端发起Ping请求"));
