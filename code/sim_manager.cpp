@@ -49,6 +49,7 @@ enum WireStage {
   WIRE_ICCID,
   WIRE_ICCID_CRSM,
   WIRE_CNUM,
+  WIRE_CIMI,
   WIRE_CNMI,
   WIRE_CMGF,
   WIRE_CEREG_ENABLE,
@@ -80,6 +81,8 @@ char responseBuffer[RESPONSE_CAPACITY];
 size_t responseLength = 0;
 String activeIccidTail;
 String activePhoneNumber;
+String activeHomePlmn;
+int activeRegistrationStatus = -1;
 bool signalKnown = false;
 bool signalRsrqKnown = false;
 int signalRsrpDbm = 0;
@@ -310,6 +313,34 @@ String parsePhoneNumber(const char* response) {
   return digits >= 3 && digits <= 20 ? number : "";
 }
 
+String parseHomePlmn(const char* response) {
+  if (!response) return "";
+  const char* line = response;
+  while (*line) {
+    while (*line == '\r' || *line == '\n' || *line == ' ' || *line == '\t') ++line;
+    const char* end = line;
+    while (*end && *end != '\r' && *end != '\n') ++end;
+    const size_t length = static_cast<size_t>(end - line);
+    if (length >= 14 && length <= 16) {
+      bool allDigits = true;
+      for (const char* p = line; p < end; ++p) {
+        if (!isDigit(*p)) {
+          allDigits = false;
+          break;
+        }
+      }
+      if (allDigits) {
+        String plmn;
+        plmn.reserve(5);
+        for (uint8_t i = 0; i < 5; ++i) plmn += line[i];
+        return plmn;
+      }
+    }
+    line = end;
+  }
+  return "";
+}
+
 void clearSignalCache() {
   signalKnown = false;
   signalRsrqKnown = false;
@@ -351,6 +382,8 @@ void invalidateCardCaches() {
   probeRegistrationNext = false;
   activeIccidTail = "";
   activePhoneNumber = "";
+  activeHomePlmn = "";
+  activeRegistrationStatus = -1;
   clearSignalCache();
   esimManagerResetCapability();
   operatorManagerInvalidate();
@@ -536,6 +569,7 @@ void handleWireResult(WireStage completed, bool ok) {
   if (completed == WIRE_CEREG_SIM_VERIFY) {
     int registration = ok ? parseCeregStatus() : -1;
     releaseWire();
+    if (registration >= 0) activeRegistrationStatus = registration;
     if (registration == 1 || registration == 5) {
       bool wasReady = state == SIM_READY && smsReady;
       candidate = OBS_UNKNOWN;
@@ -567,7 +601,10 @@ void handleWireResult(WireStage completed, bool ok) {
   if (completed == WIRE_CEREG_PROBE) {
     int registration = ok ? parseCeregStatus() : -1;
     releaseWire();
-    if (registration >= 0) modemReady = registration == 1 || registration == 5;
+    if (registration >= 0) {
+      activeRegistrationStatus = registration;
+      modemReady = registration == 1 || registration == 5;
+    }
     if (modemReady) signalNextAt = millis();
     probeRegistrationNext = false;
     nextActionAt = millis() + DETECT_INTERVAL_READY_MS;
@@ -610,7 +647,10 @@ void handleWireResult(WireStage completed, bool ok) {
       // Many operators do not provision MSISDN on the SIM. Treat an empty or
       // unsupported CNUM response as normal and continue SMS configuration.
       activePhoneNumber = "";
-      startWire("AT+CNMI=2,1,0,0,0", WIRE_CNMI);
+      startWire("AT+CIMI", WIRE_CIMI);
+    } else if (completed == WIRE_CIMI) {
+      activeHomePlmn = "";
+      startWire("AT+CNMI=2,2,0,0,0", WIRE_CNMI);
     } else if (completed == WIRE_CMEE) {
       // During insertion recovery CMEE is best effort and configuration may
       // continue. During ordinary detection, retry CMEE later so a modem that
@@ -634,6 +674,7 @@ void handleWireResult(WireStage completed, bool ok) {
   String iccidTail = completed == WIRE_ICCID ? parseIccidTail(responseBuffer) : "";
   String crsmIccidTail = completed == WIRE_ICCID_CRSM ? parseCrsmIccidTail(responseBuffer) : "";
   String phoneNumber = completed == WIRE_CNUM ? parsePhoneNumber(responseBuffer) : "";
+  String homePlmn = completed == WIRE_CIMI ? parseHomePlmn(responseBuffer) : "";
   releaseWire();
   switch (completed) {
     case WIRE_CMEE:
@@ -665,7 +706,11 @@ void handleWireResult(WireStage completed, bool ok) {
       break;
     case WIRE_CNUM:
       activePhoneNumber = phoneNumber;
-      startWire("AT+CNMI=2,1,0,0,0", WIRE_CNMI);
+      startWire("AT+CIMI", WIRE_CIMI);
+      break;
+    case WIRE_CIMI:
+      activeHomePlmn = homePlmn;
+      startWire("AT+CNMI=2,2,0,0,0", WIRE_CNMI);
       break;
     case WIRE_CNMI:
       startWire("AT+CMGF=0", WIRE_CMGF);
@@ -677,12 +722,14 @@ void handleWireResult(WireStage completed, bool ok) {
       startWire("AT+CEREG?", WIRE_CEREG_QUERY);
       break;
     case WIRE_CEREG_QUERY: {
+      activeRegistrationStatus = registration;
       modemReady = registration == 1 || registration == 5;
       probeRegistrationNext = false;
       smsReady = true;
       needsConfigure = false;
       configAttempts = 0;
       publishState(SIM_READY, true, true);
+      smsScanStoredMessages("SM", 50);
       signalNextAt = millis();
       nextActionAt = millis() + DETECT_INTERVAL_READY_MS;
       break;
@@ -722,7 +769,10 @@ void drainWire() {
         startWire("AT+CNUM", WIRE_CNUM);
       } else if (completed == WIRE_CNUM) {
         activePhoneNumber = "";
-        startWire("AT+CNMI=2,1,0,0,0", WIRE_CNMI);
+        startWire("AT+CIMI", WIRE_CIMI);
+      } else if (completed == WIRE_CIMI) {
+        activeHomePlmn = "";
+        startWire("AT+CNMI=2,2,0,0,0", WIRE_CNMI);
       } else if (completed == WIRE_CMEE && !needsConfigure) {
         nextActionAt = millis() + DETECT_INTERVAL_RETRY_MS;
       } else {
@@ -761,7 +811,10 @@ void drainWire() {
       startWire("AT+CNUM", WIRE_CNUM);
     } else if (completed == WIRE_CNUM) {
       activePhoneNumber = "";
-      startWire("AT+CNMI=2,1,0,0,0", WIRE_CNMI);
+      startWire("AT+CIMI", WIRE_CIMI);
+    } else if (completed == WIRE_CIMI) {
+      activeHomePlmn = "";
+      startWire("AT+CNMI=2,2,0,0,0", WIRE_CNMI);
     } else if (completed == WIRE_CMEE && !needsConfigure) {
       nextActionAt = millis() + DETECT_INTERVAL_RETRY_MS;
     } else {
@@ -789,6 +842,8 @@ void simManagerBegin() {
   modemReady = false;
   activeIccidTail = "";
   activePhoneNumber = "";
+  activeHomePlmn = "";
+  activeRegistrationStatus = -1;
   clearSignalCache();
   generation = 1;
   changedAt = millis();
@@ -806,6 +861,20 @@ void simManagerInvalidate() {
   invalidateCardCaches();
   publishState(SIM_DETECTING, false, false);
   nextActionAt = millis();
+}
+
+void simManagerRestoreSmsConfiguration() {
+  if (!known || !present || state == SIM_PIN_REQUIRED || state == SIM_PUK_REQUIRED ||
+      state == SIM_ABSENT) {
+    return;
+  }
+  // ML307Y may reset CMGF/CNMI while scanning or changing PLMN. Re-run the
+  // normal card configuration chain without discarding the operator scan cache.
+  smsReady = false;
+  needsConfigure = true;
+  configAttempts = 0;
+  nextActionAt = millis();
+  logCaptureLn("运营商操作结束，正在恢复短信 PDU 与上报配置");
 }
 
 void simManagerLoop() {
@@ -865,6 +934,18 @@ String simManagerIccidTail() {
 
 String simManagerPhoneNumber() {
   return activePhoneNumber;
+}
+
+String simManagerHomePlmn() {
+  return activeHomePlmn;
+}
+
+int simManagerRegistrationStatus() {
+  return activeRegistrationStatus;
+}
+
+bool simManagerIsRoaming() {
+  return activeRegistrationStatus == 5;
 }
 
 void simManagerCaptureIccid(const String &response) {

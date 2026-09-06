@@ -118,6 +118,9 @@ void handleApiStatus() {
          ",\"ready\":" + String(simManagerIsReady() ? "true" : "false") +
          ",\"smsReady\":" + String(simManagerSmsReady() ? "true" : "false") +
          ",\"phoneNumber\":\"" + jsonEscape(simManagerPhoneNumber()) + "\"" +
+         ",\"homePlmn\":\"" + jsonEscape(simManagerHomePlmn()) + "\"" +
+         ",\"registrationCode\":" + String(simManagerRegistrationStatus()) +
+         ",\"roaming\":" + String(simManagerIsRoaming() ? "true" : "false") +
          ",\"iccidTail\":\"" + jsonEscape(simManagerIccidTail()) + "\"" +
          ",\"mode\":\"" + String(esimModeName()) + "\",\"esimSupported\":" +
          esimSupportedJson +
@@ -693,7 +696,7 @@ void processPendingWebSms() {
   outboundSmsPhone = "";
   outboundSmsContent = "";
   outboundSmsState = success ? OUTBOUND_SUCCESS : OUTBOUND_FAILED;
-  outboundSmsMessage = success ? "短信发送成功" : "短信发送失败，请查看诊断日志";
+  outboundSmsMessage = success ? "运营商已接收发送请求；这不代表对方已经收到" : "短信发送失败，请查看诊断日志";
   outboundSmsUpdatedAt = millis();
   outboundSmsProcessing = false;
 }

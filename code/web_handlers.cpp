@@ -659,7 +659,7 @@ void handleSendSms() {
     logCaptureLn(String("短信内容: " + content));
 
     success = sendSMS(phone.c_str(), content.c_str());
-    resultMsg = success ? "短信发送成功" : "短信发送失败，请检查模组状态";
+    resultMsg = success ? "运营商已接收发送请求；这不代表对方已经收到" : "短信发送失败，请检查模组状态";
   }
 
   String json = "{\"success\":" + String(success ? "true" : "false") +

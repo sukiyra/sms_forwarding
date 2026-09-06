@@ -6,6 +6,7 @@
 void simManagerBegin();
 void simManagerLoop();
 void simManagerInvalidate();
+void simManagerRestoreSmsConfiguration();
 
 bool simManagerIsBusy();
 bool simManagerIsKnown();
@@ -14,6 +15,9 @@ bool simManagerIsReady();
 bool simManagerSmsReady();
 String simManagerIccidTail();
 String simManagerPhoneNumber();
+String simManagerHomePlmn();
+int simManagerRegistrationStatus();
+bool simManagerIsRoaming();
 void simManagerCaptureIccid(const String &response);
 bool simManagerSignalKnown();
 bool simManagerSignalRsrqKnown();

@@ -187,7 +187,7 @@ void modemInit() {
                    : String("⚠️ 暂未读取到接收卡 ICCID，短信来源将使用 Profile 回退标签"));
   bool cnmiReady = false;
   for (uint8_t attempt = 0; attempt < 5; ++attempt) {
-    if (sendATandWaitOK("AT+CNMI=2,1,0,0,0", 1200)) {
+    if (sendATandWaitOK("AT+CNMI=2,2,0,0,0", 1200)) {
       cnmiReady = true;
       break;
     }
@@ -351,7 +351,7 @@ bool sendSMS(const char* phoneNumber, const char* message) {
       logCapture(String(c));
       dispatchSerial1Byte(c, false);
       if (resp.indexOf("OK") >= 0) {
-        logCaptureLn(String("\n短信发送成功"));
+        logCaptureLn(String("\n运营商已接收短信发送请求"));
         endModemTransaction();
         return true;
       }

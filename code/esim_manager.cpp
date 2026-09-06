@@ -868,7 +868,7 @@ void esimManagerLoop() {
       }
       String iccidResponse = sendATCommand("AT+ICCID", 1800);
       simManagerCaptureIccid(iccidResponse);
-      bool cnmi = sendATandWaitOK("AT+CNMI=2,1,0,0,0", 1500);
+      bool cnmi = sendATandWaitOK("AT+CNMI=2,2,0,0,0", 1500);
       bool pdu = sendATandWaitOK("AT+CMGF=0", 1500);
       if (!cnmi || !pdu) {
         if (configureAttempts < 3) {

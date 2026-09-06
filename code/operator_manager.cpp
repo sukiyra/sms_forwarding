@@ -364,6 +364,7 @@ void releaseExclusive() {
 }
 
 void finishJob(bool ok, const String& message, const String& error = "", bool warning = false) {
+  const bool restoreSms = job.type == TASK_SCAN || job.type == TASK_SELECT || job.type == TASK_AUTO;
   job.active = false;
   job.done = true;
   job.ok = ok;
@@ -374,6 +375,7 @@ void finishJob(bool ok, const String& message, const String& error = "", bool wa
   job.stage = STAGE_NONE;
   releaseExclusive();
   if (invalidatePending) clearOperatorCache();
+  if (restoreSms) simManagerRestoreSmsConfiguration();
   if (job.type != TASK_QUERY) {
     logCaptureLn(String("运营商任务") + (ok ? "完成：" : "失败：") + (error.length() ? error : message));
   }

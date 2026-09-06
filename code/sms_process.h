@@ -12,6 +12,7 @@ void checkSmsReceiveTimeout();
 bool smsReceiverAwaitingPdu();
 void smsStoredMessageLoop();
 bool smsStoredMessageIsBusy();
+void smsScanStoredMessages(const char* memory, uint16_t lastIndex);
 void smsResetForSimChange();
 String readSerialLine(HardwareSerial& port);
 void dispatchSerial1Byte(char value, bool debugLog = false);

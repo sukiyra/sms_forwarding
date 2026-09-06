@@ -237,12 +237,12 @@ void processAdminCommand(const char* sender, const char* text) {
       bool success = sendSMS(targetPhone.c_str(), smsContent.c_str());
       
       // 发送邮件通知结果
-      String subject = success ? "短信发送成功" : "短信发送失败";
+      String subject = success ? "运营商已接收短信发送请求" : "短信发送失败";
       String body = "管理员命令执行结果:\n";
       body += "命令: " + cmd + "\n";
       body += "目标号码: " + targetPhone + "\n";
       body += "短信内容: " + smsContent + "\n";
-      body += "执行结果: " + String(success ? "成功" : "失败");
+      body += "执行结果: " + String(success ? "运营商已接收发送请求（不代表对方已收到）" : "失败");
       
       sendEmailNotification(subject.c_str(), body.c_str());
     } else {
@@ -348,6 +348,7 @@ struct StoredSmsEntry {
   uint32_t pduFingerprint;
   uint8_t failures;
   unsigned long nextAttemptAt;
+  bool fromBackfill;
 };
 
 StoredSmsEntry storedSmsQueue[STORED_SMS_QUEUE_CAPACITY] = {};
@@ -358,6 +359,10 @@ bool storedSmsOwnsExclusive = false;
 bool storedSmsPduLinePending = false;
 bool directCmtAfterCmgrHeader = false;
 bool preserveStoredSmsQueueForTransportReset = false;
+bool storedSmsBackfillActive = false;
+char storedSmsBackfillMemory[3] = {'S', 'M', '\0'};
+uint16_t storedSmsBackfillNextIndex = 1;
+uint16_t storedSmsBackfillLastIndex = 0;
 unsigned long storedSmsCommandStartedAt = 0;
 char storedSmsResponse[STORED_SMS_RESPONSE_CAPACITY] = {};
 size_t storedSmsResponseLength = 0;
@@ -395,7 +400,7 @@ bool parseCmti(const String& line, String& memory, uint16_t& index) {
   return true;
 }
 
-void enqueueStoredSms(const String& memory, uint16_t index) {
+void enqueueStoredSms(const String& memory, uint16_t index, bool fromBackfill = false) {
   int freeSlot = -1;
   for (uint8_t i = 0; i < STORED_SMS_QUEUE_CAPACITY; ++i) {
     if (storedSmsQueue[i].used) {
@@ -425,8 +430,11 @@ void enqueueStoredSms(const String& memory, uint16_t index) {
   entry.pduFingerprint = 0;
   entry.failures = 0;
   entry.nextAttemptAt = millis();
-  logCaptureF("检测到模组已存短信：%s/%u，已加入读取队列\n",
-              entry.memory, static_cast<unsigned>(entry.index));
+  entry.fromBackfill = fromBackfill;
+  if (!fromBackfill) {
+    logCaptureF("检测到模组已存短信：%s/%u，已加入读取队列\n",
+                entry.memory, static_cast<unsigned>(entry.index));
+  }
 }
 
 void observeCmtiLine(const String& line) {
@@ -591,6 +599,7 @@ void clearStoredSmsEntry(uint8_t slot) {
   storedSmsQueue[slot].pduFingerprint = 0;
   storedSmsQueue[slot].failures = 0;
   storedSmsQueue[slot].nextAttemptAt = 0;
+  storedSmsQueue[slot].fromBackfill = false;
 }
 
 unsigned long storedSmsRetryDelay(uint8_t failures) {
@@ -875,6 +884,13 @@ void drainStoredSmsWire() {
     if (storedSmsStage == STORED_SMS_CMGR && storedSmsActiveSlot >= 0 &&
         storedSmsActiveSlot < STORED_SMS_QUEUE_CAPACITY) {
       StoredSmsEntry& entry = storedSmsQueue[storedSmsActiveSlot];
+      if (entry.used && entry.fromBackfill && !entry.processed) {
+        // A range scan intentionally probes empty SIM indexes. Any failed read
+        // is skipped and will be checked again after the next boot/PLMN restore.
+        clearStoredSmsEntry(storedSmsActiveSlot);
+        releaseStoredSmsWire();
+        return;
+      }
       if (entry.used && storedSmsIndexMissingError()) {
         char memory[3] = {entry.memory[0], entry.memory[1], '\0'};
         uint16_t index = entry.index;
@@ -1010,11 +1026,33 @@ void smsStoredMessageLoop() {
     return;
   }
   int8_t slot = nextStoredSmsSlot();
+  if (slot < 0 && storedSmsBackfillActive) {
+    if (storedSmsBackfillNextIndex <= storedSmsBackfillLastIndex) {
+      enqueueStoredSms(String(storedSmsBackfillMemory), storedSmsBackfillNextIndex++, true);
+      slot = nextStoredSmsSlot();
+    } else {
+      storedSmsBackfillActive = false;
+      logCaptureLn(String("模组积压短信扫描完成"));
+    }
+  }
   if (slot >= 0) startStoredSmsAttempt(slot);
 }
 
 bool smsStoredMessageIsBusy() {
   return storedSmsStage != STORED_SMS_IDLE || storedSmsOwnsExclusive;
+}
+
+void smsScanStoredMessages(const char* memory, uint16_t lastIndex) {
+  String requested = memory ? String(memory) : String();
+  if (!supportedSmsMemory(requested) || lastIndex == 0) return;
+  storedSmsBackfillMemory[0] = requested.charAt(0);
+  storedSmsBackfillMemory[1] = requested.charAt(1);
+  storedSmsBackfillMemory[2] = '\0';
+  storedSmsBackfillNextIndex = 1;
+  storedSmsBackfillLastIndex = lastIndex;
+  storedSmsBackfillActive = true;
+  logCaptureF("开始扫描模组积压短信：%s/1-%u\n", storedSmsBackfillMemory,
+              static_cast<unsigned>(lastIndex));
 }
 
 void smsResetForSimChange() {
@@ -1031,6 +1069,9 @@ void smsResetForSimChange() {
     for (uint8_t i = 0; i < STORED_SMS_QUEUE_CAPACITY; ++i) {
       clearStoredSmsEntry(i);
     }
+    storedSmsBackfillActive = false;
+    storedSmsBackfillNextIndex = 1;
+    storedSmsBackfillLastIndex = 0;
   }
   smsRxState = SMS_RX_IDLE;
   smsRxStartedAt = 0;
