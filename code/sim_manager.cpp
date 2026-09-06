@@ -51,6 +51,7 @@ enum WireStage {
   WIRE_CNUM,
   WIRE_CIMI,
   WIRE_CNMI,
+  WIRE_CNMI_STORED,
   WIRE_CMGF,
   WIRE_CEREG_ENABLE,
   WIRE_CEREG_QUERY,
@@ -379,6 +380,7 @@ bool updateSignalFromCesq() {
 void invalidateCardCaches() {
   modemReady = false;
   smsReady = false;
+  modemSetSmsDeliveryMode("unconfigured");
   probeRegistrationNext = false;
   activeIccidTail = "";
   activePhoneNumber = "";
@@ -546,6 +548,7 @@ bool startWire(const char* command, WireStage stage, unsigned long timeout) {
 
 void scheduleConfigurationRetry() {
   smsReady = false;
+  modemSetSmsDeliveryMode("unconfigured");
   needsConfigure = true;
   if (configAttempts < 255) ++configAttempts;
   if (configAttempts >= MAX_CONFIG_ATTEMPTS) {
@@ -651,6 +654,8 @@ void handleWireResult(WireStage completed, bool ok) {
     } else if (completed == WIRE_CIMI) {
       activeHomePlmn = "";
       startWire("AT+CNMI=2,2,0,0,0", WIRE_CNMI);
+    } else if (completed == WIRE_CNMI) {
+      startWire("AT+CNMI=2,1,0,0,0", WIRE_CNMI_STORED);
     } else if (completed == WIRE_CMEE) {
       // During insertion recovery CMEE is best effort and configuration may
       // continue. During ordinary detection, retry CMEE later so a modem that
@@ -713,6 +718,11 @@ void handleWireResult(WireStage completed, bool ok) {
       startWire("AT+CNMI=2,2,0,0,0", WIRE_CNMI);
       break;
     case WIRE_CNMI:
+      modemSetSmsDeliveryMode("direct");
+      startWire("AT+CMGF=0", WIRE_CMGF);
+      break;
+    case WIRE_CNMI_STORED:
+      modemSetSmsDeliveryMode("stored");
       startWire("AT+CMGF=0", WIRE_CMGF);
       break;
     case WIRE_CMGF:
@@ -773,6 +783,8 @@ void drainWire() {
       } else if (completed == WIRE_CIMI) {
         activeHomePlmn = "";
         startWire("AT+CNMI=2,2,0,0,0", WIRE_CNMI);
+      } else if (completed == WIRE_CNMI) {
+        startWire("AT+CNMI=2,1,0,0,0", WIRE_CNMI_STORED);
       } else if (completed == WIRE_CMEE && !needsConfigure) {
         nextActionAt = millis() + DETECT_INTERVAL_RETRY_MS;
       } else {
@@ -815,6 +827,8 @@ void drainWire() {
     } else if (completed == WIRE_CIMI) {
       activeHomePlmn = "";
       startWire("AT+CNMI=2,2,0,0,0", WIRE_CNMI);
+    } else if (completed == WIRE_CNMI) {
+      startWire("AT+CNMI=2,1,0,0,0", WIRE_CNMI_STORED);
     } else if (completed == WIRE_CMEE && !needsConfigure) {
       nextActionAt = millis() + DETECT_INTERVAL_RETRY_MS;
     } else {
@@ -868,9 +882,10 @@ void simManagerRestoreSmsConfiguration() {
       state == SIM_ABSENT) {
     return;
   }
-  // ML307Y may reset CMGF/CNMI while scanning or changing PLMN. Re-run the
+  // Some ML307 firmware resets CMGF/CNMI while scanning or changing PLMN. Re-run the
   // normal card configuration chain without discarding the operator scan cache.
   smsReady = false;
+  modemSetSmsDeliveryMode("unconfigured");
   needsConfigure = true;
   configAttempts = 0;
   nextActionAt = millis();

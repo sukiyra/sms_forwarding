@@ -3,11 +3,15 @@
 #include "sms_process.h"
 #include "operator_manager.h"
 #include "sim_manager.h"
+#include "modem_profile.h"
 
 namespace {
 uint8_t modemTransactionDepth = 0;
 bool modemBooting = false;
 bool modemExclusive = false;
+bool pdpContextControlSupported = false;
+bool detectedModelSupported = false;
+String smsDeliveryMode = "unconfigured";
 
 void beginModemTransaction() {
   if (modemTransactionDepth < 255) ++modemTransactionDepth;
@@ -27,9 +31,19 @@ bool modemIsBooting() {
 }
 
 bool modemSupportsPdpContextControl() {
-  // The ML307Y AT firmware used by this board does not safely support the
-  // CGACT context toggle used by ML307R-DC. SMS operation does not require it.
-  return !detectedModemModel.startsWith("ML307Y");
+  return pdpContextControlSupported;
+}
+
+bool modemModelSupported() {
+  return detectedModelSupported;
+}
+
+const char* modemSmsDeliveryMode() {
+  return smsDeliveryMode.c_str();
+}
+
+void modemSetSmsDeliveryMode(const char* mode) {
+  smsDeliveryMode = mode ? mode : "unconfigured";
 }
 
 bool modemAcquireExclusive() {
@@ -107,6 +121,7 @@ void modemInit() {
   operatorManagerInvalidate();
   modemBooting = true;
   modemReady = false;
+  modemSetSmsDeliveryMode("unconfigured");
   checkSerial1URC();
 
   bool atReady = false;
@@ -128,43 +143,46 @@ void modemInit() {
     logCaptureLn(String("⚠️ 无法启用数值 CME 错误，SIM 检测将继续重试"));
   }
 
-  //判断型号，做一些特定操作
-  bool need_set_CGACT = true;
+  // Different ML307 generations format ATI differently. Query the standardized
+  // identity commands as well, then classify by the complete model string.
   detectedModemManufacturer = "未知";
   detectedModemModel = "ML307";
   detectedModemFirmware = "未知";
+  detectedModemFamily = "未知";
+  detectedModelSupported = false;
+  pdpContextControlSupported = false;
   String resp = sendATCommand("ATI", 2000);
   logCaptureLn(String("ATI响应: " + resp));
-  if (resp.indexOf("OK") >= 0) {
-    // 解析ATI响应
-    String manufacturer = "未知";
-    String model = "未知";
-    String version = "未知";
-    
-    // 按行解析
-    int lineStart = 0;
-    int lineNum = 0;
-    for (int i = 0; i < resp.length(); i++) {
-      if (resp.charAt(i) == '\n' || i == resp.length() - 1) {
-        String line = resp.substring(lineStart, i);
-        line.trim();
-        if (line.length() > 0 && line != "ATI" && line != "OK") {
-          lineNum++;
-          if (lineNum == 1) manufacturer = line;
-          else if (lineNum == 2) model = line;
-          else if (lineNum == 3) version = line;
-        }
-        lineStart = i + 1;
-      }
-    }
-    detectedModemManufacturer = manufacturer;
-    detectedModemModel = model;
-    detectedModemFirmware = version;
-    // ML307Y 的固件不安全支持该 PDP 上下文切换；短信无需数据上下文。
-    if (model.startsWith("ML307Y")) need_set_CGACT = false;
+  String atiModel = modemIdentityValue(resp, "ATI", "", true);
+  String manufacturerResponse = sendATCommand("AT+CGMI", 1600);
+  String modelResponse = sendATCommand("AT+CGMM", 1600);
+  String firmwareResponse = sendATCommand("AT+CGMR", 1600);
+  String manufacturer = modemIdentityValue(manufacturerResponse, "AT+CGMI", "+CGMI:", false);
+  String model = modemIdentityValue(modelResponse, "AT+CGMM", "+CGMM:", true);
+  String version = modemIdentityValue(firmwareResponse, "AT+CGMR", "+CGMR:", false);
+  if (!manufacturer.length()) manufacturer = modemIdentityValue(resp, "ATI", "", false);
+  if (!model.length()) model = atiModel;
+  if (manufacturer.length()) detectedModemManufacturer = manufacturer;
+  if (model.length()) detectedModemModel = model;
+  if (version.length()) detectedModemFirmware = version;
+
+  ModemProfile profile = modemClassify(detectedModemModel + "\n" + atiModel);
+  detectedModemFamily = profile.familyName;
+  detectedModelSupported = profile.supported;
+  if (profile.supported) {
+    logCaptureLn(String("模组自动识别：") + profile.familyName + " / " + detectedModemModel);
+  } else {
+    logCaptureLn(String("⚠️ 未识别的模组料号：") + detectedModemModel +
+                 "；将仅尝试标准短信指令");
   }
 
-  if(need_set_CGACT) {
+  if (profile.mayProbePdpContext) {
+    String capability = sendATCommand("AT+CGACT=?", 1800);
+    pdpContextControlSupported = capability.indexOf("OK") >= 0 &&
+                                 capability.indexOf("ERROR") < 0;
+  }
+
+  if (pdpContextControlSupported) {
     bool dataDisabled = false;
     for (uint8_t attempt = 0; attempt < 3; ++attempt) {
       if (sendATandWaitOK("AT+CGACT=0,1", 5000)) {
@@ -177,7 +195,7 @@ void modemInit() {
     logCaptureLn(dataDisabled ? String("已禁用数据连接(AT+CGACT=0,1)，防止流量消耗")
                               : String("⚠️ 无法确认数据连接已禁用"));
   } else {
-    logCaptureLn(String("ML307Y 兼容模式：跳过 AT+CGACT=0,1，短信功能不受影响"));
+    logCaptureLn(String("兼容模式：跳过 AT+CGACT=0,1，短信功能不受影响"));
   }
   String iccidResponse = sendATCommand("AT+ICCID", 2000);
   simManagerCaptureIccid(iccidResponse);
@@ -189,9 +207,22 @@ void modemInit() {
   for (uint8_t attempt = 0; attempt < 5; ++attempt) {
     if (sendATandWaitOK("AT+CNMI=2,2,0,0,0", 1200)) {
       cnmiReady = true;
+      modemSetSmsDeliveryMode("direct");
       break;
     }
     blink_short(200);
+  }
+  if (!cnmiReady) {
+    // Some A/C firmware only accepts stored-message notifications. The +CMTI
+    // reader selects the memory named by the URC before reading and deleting it.
+    for (uint8_t attempt = 0; attempt < 3; ++attempt) {
+      if (sendATandWaitOK("AT+CNMI=2,1,0,0,0", 1200)) {
+        cnmiReady = true;
+        modemSetSmsDeliveryMode("stored");
+        break;
+      }
+      blink_short(200);
+    }
   }
   bool pduReady = false;
   for (uint8_t attempt = 0; attempt < 5; ++attempt) {
@@ -206,7 +237,7 @@ void modemInit() {
     modemBooting = false;
     return;
   }
-  logCaptureLn(String("短信PDU上报配置完成"));
+  logCaptureLn(String("短信PDU上报配置完成，模式：") + modemSmsDeliveryMode());
   sendATandWaitOK("AT+CEREG=2", 1200);  // 启用网络注册状态变化上报
   logCaptureLn(String("PDU模式设置完成"));
   int ceregRetry = 0;

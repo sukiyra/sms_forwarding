@@ -102,7 +102,11 @@ void handleApiStatus() {
          ",\"wifi\":{\"connected\":" + String(WiFi.isConnected() ? "true" : "false") +
          ",\"ssid\":\"" + jsonEscape(WiFi.SSID()) + "\",\"rssi\":" + String(WiFi.RSSI()) +
          ",\"ip\":\"" + WiFi.localIP().toString() + "\"},\"modem\":{\"ready\":" +
-         String(modemReady ? "true" : "false") + ",\"model\":\"" + jsonEscape(detectedModemModel) + "\",\"operator\":\"" +
+         String(modemReady ? "true" : "false") + ",\"model\":\"" + jsonEscape(detectedModemModel) +
+         "\",\"family\":\"" + jsonEscape(detectedModemFamily) +
+         "\",\"supported\":" + String(modemModelSupported() ? "true" : "false") +
+         ",\"firmware\":\"" + jsonEscape(detectedModemFirmware) +
+         "\",\"smsDelivery\":\"" + jsonEscape(modemSmsDeliveryMode()) + "\",\"operator\":\"" +
          jsonEscape(networkOperator) + "\",\"busy\":" +
          String(modemIsBusy() ? "true" : "false") +
          ",\"plmn\":\"" + jsonEscape(networkPlmn) + "\",\"act\":" + String(networkAct) +

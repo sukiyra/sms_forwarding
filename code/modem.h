@@ -14,6 +14,9 @@ bool sendSMS(const char* phoneNumber, const char* message);
 bool modemIsBusy();
 bool modemIsBooting();
 bool modemSupportsPdpContextControl();
+bool modemModelSupported();
+const char* modemSmsDeliveryMode();
+void modemSetSmsDeliveryMode(const char* mode);
 bool modemAcquireExclusive();
 void modemReleaseExclusive();
 

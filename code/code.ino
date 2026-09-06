@@ -11,6 +11,7 @@
 #include "esim_manager.h"
 #include "operator_manager.h"
 #include "sim_manager.h"
+#include "factory_serial.h"
 
 void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
@@ -120,7 +121,7 @@ void loop() {
   }
   if (!esimIsBusy() && !operatorManagerIsBusy() && !simManagerIsBusy() &&
       !smsStoredMessageIsBusy()) {
-    if (Serial.available()) Serial1.write(Serial.read());
+    factorySerialLoop();
     checkSerial1URC();
   }
   // Web requests only enqueue outbound SMS so the browser gets an immediate
